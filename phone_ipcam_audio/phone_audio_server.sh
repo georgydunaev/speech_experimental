@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Separate, strictly-local project: phone-as-network-microphone (IP Webcam audio-like)
-# Phone browser -> WebSocket -> laptop ffmpeg decode -> faster-whisper continuous transcription.
+# Phone browser to WebSocket to laptop ffmpeg decode to faster-whisper continuous transcription.
 # - NO system package installation (no apt/dnf/pacman, no sudo)
 # - NO global/user Python package installation
 # - All state inside this project folder: .venv/, .home/
@@ -826,7 +826,7 @@ async def main_async(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Phone-as-mic local audio stream server -> text")
+    ap = argparse.ArgumentParser(description="Phone-as-mic local audio stream server to text")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--model", default="small")

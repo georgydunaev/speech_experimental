@@ -11,6 +11,10 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -28,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Runs an ongoing foreground service with FOREGROUND_SERVICE_TYPE_MICROPHONE
  * and a PARTIAL_WAKE_LOCK, preventing MIUI power keeper from killing audio recording.
+ * Supports local offline chunk buffering and immediate queue replay on network reconnection.
  */
 class AudioForegroundService : Service() {
 
@@ -52,6 +57,9 @@ class AudioForegroundService : Service() {
     private var audioRecord: AudioRecord? = null
     private var recordingThread: Thread? = null
     private var senderThread: Thread? = null
+
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private var serverHost = "192.168.1.100"
     private var serverPort = 8080
@@ -121,6 +129,33 @@ class AudioForegroundService : Service() {
             .build()
     }
 
+    private fun registerNetworkCallback() {
+        try {
+            connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.d(TAG, "Network available, notifying sender thread for queue replay")
+                    senderThread?.interrupt()
+                }
+            }
+            connectivityManager?.registerNetworkCallback(request, networkCallback!!)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register network callback", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister network callback", e)
+        }
+        networkCallback = null
+    }
+
     private fun startRecordingService() {
         if (isRunning.getAndSet(true)) return
 
@@ -162,6 +197,8 @@ class AudioForegroundService : Service() {
             return
         }
 
+        registerNetworkCallback()
+
         recordingThread = Thread({ runRecordingLoop() }, "AudioRecordThread").apply { start() }
         senderThread = Thread({ runSenderLoop() }, "AudioSenderThread").apply { start() }
     }
@@ -192,7 +229,7 @@ class AudioForegroundService : Service() {
                 try {
                     Thread.sleep(50)
                 } catch (ignored: InterruptedException) {
-                    break
+                    if (!isRunning.get()) break
                 }
                 continue
             }
@@ -202,11 +239,12 @@ class AudioForegroundService : Service() {
             if (success) {
                 chunkBuffer.pop()
             } else {
-                // Network unavailable; back off briefly and retry
+                chunkBuffer.markRetry(pending.seqId)
+                // Network unavailable; back off briefly and retry or wait for network callback interrupt
                 try {
                     Thread.sleep(1000)
                 } catch (ignored: InterruptedException) {
-                    break
+                    if (!isRunning.get()) break
                 }
             }
         }
@@ -236,6 +274,7 @@ class AudioForegroundService : Service() {
 
     private fun stopRecordingService() {
         isRunning.set(false)
+        unregisterNetworkCallback()
         recordingThread?.interrupt()
         senderThread?.interrupt()
 

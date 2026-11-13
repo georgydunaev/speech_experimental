@@ -70,8 +70,20 @@ class MainActivity : Activity() {
         }
         layout.addView(btnStop)
 
+        val btnAutostart = Button(this).apply {
+            text = "MIUI Autostart Settings"
+            setOnClickListener { MiuiOptimizationHelper.openAutostartSettings(this@MainActivity) }
+        }
+        layout.addView(btnAutostart)
+
+        val btnBatterySaver = Button(this).apply {
+            text = "MIUI Battery Saver (Set No Restrictions)"
+            setOnClickListener { MiuiOptimizationHelper.openBatterySaverSettings(this@MainActivity) }
+        }
+        layout.addView(btnBatterySaver)
+
         textStatus = TextView(this).apply {
-            text = "Status: Idle\n\nMIUI Battery Note: Go to App Info > Battery Saver > Select 'No restrictions'."
+            text = "Status: Idle\n\nMIUI Battery Note: Go to App Info, Battery Saver, Select 'No restrictions'."
             setPadding(0, 24, 0, 0)
         }
         layout.addView(textStatus)

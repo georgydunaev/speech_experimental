@@ -105,7 +105,20 @@ class SpeechRecorderClient {
   }
 
   _startSilentAudioKeepalive() {
-    // Generates a continuous low-level silent tone to keep audio context active in background
+    // 1. HTML5 audio element loop with silent WAV data URI for OS media session lock
+    try {
+      if (!this.silentAudio) {
+        this.silentAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=');
+        this.silentAudio.loop = true;
+      }
+      this.silentAudio.play().catch((err) => {
+        console.warn('Silent audio tag play notice:', err);
+      });
+    } catch (err) {
+      console.warn('Silent audio tag init failed:', err);
+    }
+
+    // 2. Web Audio oscillator keepalive
     try {
       if (!this.audioCtx) return;
       const osc = this.audioCtx.createOscillator();
@@ -115,7 +128,17 @@ class SpeechRecorderClient {
       gain.connect(this.audioCtx.destination);
       osc.start();
     } catch (err) {
-      console.warn('Silent audio keepalive failed:', err);
+      console.warn('Silent oscillator keepalive failed:', err);
+    }
+  }
+
+  _stopSilentAudioKeepalive() {
+    if (this.silentAudio) {
+      try {
+        this.silentAudio.pause();
+        this.silentAudio.currentTime = 0;
+      } catch (_) {}
+      this.silentAudio = null;
     }
   }
 
@@ -174,6 +197,7 @@ class SpeechRecorderClient {
   stop() {
     this.isRecording = false;
     this.onStatusChange('Stopped');
+    this._stopSilentAudioKeepalive();
 
     if (this.worker) {
       this.worker.postMessage({ command: 'stop' });

@@ -57,6 +57,17 @@ class TestServerProtocol(unittest.TestCase):
         flushed = self.session.flush(client_id="test_client")
         self.assertIsInstance(flushed, list)
 
+    def test_session_state_preservation(self):
+        # Multiple ingest calls maintain byte totals and chunk counts
+        c1 = b"\x00\x00" * 800
+        c2 = b"\x00\x00" * 800
+        self.session.ingest_chunk(seq_id=0, audio_bytes=c1, client_id="c1")
+        self.session.ingest_chunk(seq_id=1, audio_bytes=c2, client_id="c1")
+
+        self.assertEqual(self.session.total_chunks, 2)
+        self.assertEqual(self.session.total_pcm_bytes, 3200)
+        self.assertEqual(self.session.jitter_buffer.expected_seq_id, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
