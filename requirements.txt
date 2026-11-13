@@ -1,0 +1,9 @@
+# Core ASR runtime (CTranslate2-based Whisper)
+faster-whisper>=1.0.0
+
+# Audio capture and processing
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Optional helpers (WAV/file handling uses stdlib+ffmpeg; these are useful extras)
+webrtcvad>=2.0.10
