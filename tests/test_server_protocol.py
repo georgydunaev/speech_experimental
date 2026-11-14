@@ -1,7 +1,13 @@
 """Unit tests for Server Protocol and Session Handling."""
 
+import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
 
 from server.audio_server import ClientSession
 from server.transcriber import Transcriber
@@ -11,9 +17,7 @@ class MockTranscriber(Transcriber):
     """Mock transcriber that doesn't load heavy models for unit testing."""
 
     def __init__(self):
-        self.model_name = "mock_small"
-        self.device = "cpu"
-        self.compute_type = "int8"
+        super().__init__(model_name="mock_small", device="cpu", compute_type="int8")
         self.transcribed_chunks = []
 
     def transcribe_chunk(self, chunk, client_id=None):

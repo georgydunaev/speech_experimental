@@ -26,12 +26,12 @@ import numpy as np
 
 try:
     from server.transcript_logger import TranscriptLogger
-    from server.vad import SpeechSegmenter
+    from server.vad import EnergyVAD, SpeechSegmenter
 except ImportError:
     # Fallback if invoked outside package root
     sys.path.insert(0, str(Path(__file__).parent))
     from server.transcript_logger import TranscriptLogger
-    from server.vad import SpeechSegmenter
+    from server.vad import EnergyVAD, SpeechSegmenter
 
 
 def detect_device(requested: str, requested_compute: Optional[str]):
@@ -116,6 +116,7 @@ def transcribe_file_streaming(
                 end_sec=seg.end or 0.0,
                 language=detected_lang,
                 language_prob=detected_prob,
+                avg_logprob=getattr(seg, "avg_logprob", None),
                 client_id="file",
             )
         sys.stdout.flush()
@@ -143,7 +144,7 @@ def transcribe_microphone(
     device_index: Optional[int],
     channels: int,
     logger: Optional[TranscriptLogger] = None,
-    adaptive_vad: bool = False,
+    adaptive_vad: bool = True,
 ):
     """Capture microphone audio in chunks and transcribe each chunk on-the-fly."""
     try:
@@ -174,6 +175,7 @@ def transcribe_microphone(
     )
 
     segmenter = SpeechSegmenter(sample_rate=samplerate) if adaptive_vad else None
+    energy_vad = EnergyVAD(sample_rate=samplerate) if not adaptive_vad else None
     buffer = np.zeros((0,), dtype=np.float32)
     time_offset = 0.0
 
@@ -221,18 +223,32 @@ def transcribe_microphone(
                                         end_sec=end,
                                         language=detected_lang,
                                         language_prob=detected_prob,
+                                        avg_logprob=getattr(seg, "avg_logprob", None),
                                         client_id="mic",
                                     )
                                 sys.stdout.flush()
                 else:
+                    # Fixed-interval chunking with adaptive noise floor silence accumulation filter
                     chunk_frames = int(samplerate * chunk_seconds)
                     buffer = np.concatenate([buffer, data])
                     while len(buffer) >= chunk_frames:
                         chunk = buffer[:chunk_frames]
                         buffer = buffer[chunk_frames:]
+
                         rms = float(np.sqrt(np.mean(np.square(chunk))) if len(chunk) else 0.0)
-                        if rms < 1e-4:
-                            print(f"[{format_ts(time_offset)}] (silence)")
+                        dynamic_thresh = max(
+                            energy_vad.min_energy_threshold,
+                            energy_vad.noise_floor * energy_vad.snr_multiplier,
+                        ) if energy_vad is not None else 0.005
+
+                        if rms < dynamic_thresh:
+                            # Update noise floor during non-speech and inhibit Whisper inference
+                            if energy_vad is not None:
+                                energy_vad.noise_floor = (
+                                    (1.0 - energy_vad.noise_floor_alpha) * energy_vad.noise_floor
+                                    + energy_vad.noise_floor_alpha * rms
+                                )
+                            print(f"[{format_ts(time_offset)}] (silence, rms={rms:.4f}, floor={energy_vad.noise_floor:.4f if energy_vad else 0.0:.4f})")
                             time_offset += chunk_seconds
                             continue
 
@@ -265,12 +281,16 @@ def transcribe_microphone(
                                             end_sec=end,
                                             language=detected_lang,
                                             language_prob=detected_prob,
+                                            avg_logprob=getattr(seg, "avg_logprob", None),
                                             client_id="mic",
                                         )
                         sys.stdout.flush()
                         time_offset += chunk_seconds
     except KeyboardInterrupt:
         print("\n[INFO] Stopped.")
+    finally:
+        if logger:
+            logger.close()
 
 
 def list_devices():
@@ -307,10 +327,12 @@ def main():
     ap.add_argument("--samplerate", type=int, default=16000, help="Microphone sample rate (default: 16000)")
     ap.add_argument("--mic-device", type=int, default=None, help="Input device index for microphone")
     ap.add_argument("--channels", type=int, default=1, help="Microphone channels to capture (default: 1)")
-    ap.add_argument("--adaptive-vad", action="store_true", help="Use adaptive speech boundary chunking with pre/post-roll")
+    ap.add_argument("--adaptive-vad", action="store_true", default=True, help="Use adaptive speech boundary chunking with pre/post-roll (default: True)")
+    ap.add_argument("--no-adaptive-vad", action="store_false", dest="adaptive_vad", help="Disable adaptive VAD and use fixed-interval chunking")
 
     # Logging options
-    ap.add_argument("--log-dir", default=None, help="Directory to save rotating JSONL and Markdown transcript logs")
+    ap.add_argument("--log-dir", default="logs", help="Directory to save rotating JSONL and Markdown transcript logs (default: logs)")
+    ap.add_argument("--no-log", action="store_true", help="Disable transcript logging to disk")
     ap.add_argument("--session-id", default=None, help="Session identifier for logs (default: auto timestamp)")
 
     args = ap.parse_args()
@@ -322,7 +344,9 @@ def main():
     if not args.file and not args.mic:
         ap.error("one of --file, --mic, or --list-devices is required")
 
-    logger = TranscriptLogger(log_dir=args.log_dir, session_id=args.session_id) if args.log_dir else None
+    logger = None
+    if not args.no_log and args.log_dir:
+        logger = TranscriptLogger(log_dir=args.log_dir, session_id=args.session_id)
 
     device, compute_type = detect_device(args.device, args.compute_type)
     print(f"[INFO] Selected device={device} compute_type={compute_type}")
@@ -330,24 +354,28 @@ def main():
     model = load_model(args.model, device, compute_type, cpu_threads=args.cpu_threads)
     vad_filter = not args.no_vad
 
-    if args.file:
-        if not Path(args.file).exists():
-            print(f"[ERROR] File not found: {args.file}", file=sys.stderr)
-            sys.exit(2)
-        transcribe_file_streaming(model, args.file, args.language, args.beam_size, vad_filter, logger=logger)
-    else:
-        transcribe_microphone(
-            model=model,
-            language=args.language,
-            beam_size=args.beam_size,
-            vad_filter=vad_filter,
-            samplerate=args.samplerate,
-            chunk_seconds=args.chunk_seconds,
-            device_index=args.mic_device,
-            channels=args.channels,
-            logger=logger,
-            adaptive_vad=args.adaptive_vad,
-        )
+    try:
+        if args.file:
+            if not Path(args.file).exists():
+                print(f"[ERROR] File not found: {args.file}", file=sys.stderr)
+                sys.exit(2)
+            transcribe_file_streaming(model, args.file, args.language, args.beam_size, vad_filter, logger=logger)
+        else:
+            transcribe_microphone(
+                model=model,
+                language=args.language,
+                beam_size=args.beam_size,
+                vad_filter=vad_filter,
+                samplerate=args.samplerate,
+                chunk_seconds=args.chunk_seconds,
+                device_index=args.mic_device,
+                channels=args.channels,
+                logger=logger,
+                adaptive_vad=args.adaptive_vad,
+            )
+    finally:
+        if logger:
+            logger.close()
 
 
 if __name__ == "__main__":

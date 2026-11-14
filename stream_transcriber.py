@@ -1,6 +1,7 @@
 """
 Continuous audio stream transcriber using faster-whisper.
 Reads raw PCM (16kHz s16le mono) from standard input and prints transcriptions.
+Integrates adaptive VAD silence accumulation filtering.
 """
 
 from __future__ import annotations
@@ -14,6 +15,12 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+try:
+    from server.vad import EnergyVAD, SpeechSegmenter
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from server.vad import EnergyVAD, SpeechSegmenter
 
 
 def normalize_language(lang: Optional[str]) -> Optional[str]:
@@ -100,14 +107,67 @@ def transcribe_chunk(model, chunk_f32, language, beam_size, vad_filter):
         return list(segments), info
 
 
-def stream_from_stdin(model, language, beam_size, vad_filter, chunk_seconds, samplerate=16000):
+def stream_from_stdin(
+    model,
+    language,
+    beam_size,
+    vad_filter,
+    chunk_seconds,
+    samplerate=16000,
+    adaptive_vad=True,
+):
+    print(f"[INFO] Listening for continuous PCM stream (16kHz mono s16le), chunk={chunk_seconds}s, adaptive_vad={adaptive_vad} ...")
+
+    if adaptive_vad:
+        segmenter = SpeechSegmenter(sample_rate=samplerate)
+        got_any = False
+        try:
+            while True:
+                data = sys.stdin.buffer.read(4096)
+                if not data:
+                    break
+                got_any = True
+                speech_chunks = segmenter.feed_pcm16_bytes(data)
+                for sc in speech_chunks:
+                    t0 = time.time()
+                    segments, _info = transcribe_chunk(model, sc.audio_data, language, beam_size, vad_filter)
+                    dt = time.time() - t0
+                    if not segments:
+                        print(f"[{format_ts(sc.start_sec)}] (no speech, {dt:.2f}s)")
+                    else:
+                        for seg in segments:
+                            start = sc.start_sec + (seg.start or 0.0)
+                            end = sc.start_sec + (seg.end or sc.duration_sec)
+                            text = (seg.text or "").strip()
+                            if text:
+                                print(f"[{format_ts(start)} to {format_ts(end)}] {text}  ({dt:.2f}s)")
+                    sys.stdout.flush()
+
+            # Flush remaining audio
+            trailing = segmenter.flush()
+            for sc in trailing:
+                segments, _info = transcribe_chunk(model, sc.audio_data, language, beam_size, vad_filter)
+                for seg in segments:
+                    start = sc.start_sec + (seg.start or 0.0)
+                    end = sc.start_sec + (seg.end or sc.duration_sec)
+                    text = (seg.text or "").strip()
+                    if text:
+                        print(f"[{format_ts(start)} to {format_ts(end)}] {text}")
+        except KeyboardInterrupt:
+            print("\n[INFO] Stopped.")
+            return
+        if not got_any:
+            print("[WARN] No audio data received. Check that the phone/source is streaming and the URL/port is correct.")
+        return
+
+    # Fixed-interval chunking with EnergyVAD noise floor filter
     bytes_per_sample = 2  # s16le mono
     chunk_bytes = int(samplerate * chunk_seconds * bytes_per_sample)
     if chunk_bytes <= 0:
         print("[ERROR] --chunk-seconds must be greater than 0", file=sys.stderr)
         sys.exit(2)
 
-    print(f"[INFO] Listening for continuous PCM stream (16kHz mono s16le), chunk={chunk_seconds}s ...")
+    energy_vad = EnergyVAD(sample_rate=samplerate)
     buf = bytearray()
     time_offset = 0.0
     got_any = False
@@ -123,9 +183,19 @@ def stream_from_stdin(model, language, beam_size, vad_filter, chunk_seconds, sam
                 del buf[:chunk_bytes]
                 audio_i16 = np.frombuffer(part, dtype=np.int16)
                 audio_f32 = audio_i16.astype(np.float32) / 32768.0
+
                 rms = float(np.sqrt(np.mean(np.square(audio_f32))) if audio_f32.size else 0.0)
-                if rms < 1e-4:
-                    print(f"[{format_ts(time_offset)}] (silence)")
+                dynamic_thresh = max(
+                    energy_vad.min_energy_threshold,
+                    energy_vad.noise_floor * energy_vad.snr_multiplier,
+                )
+
+                if rms < dynamic_thresh:
+                    energy_vad.noise_floor = (
+                        (1.0 - energy_vad.noise_floor_alpha) * energy_vad.noise_floor
+                        + energy_vad.noise_floor_alpha * rms
+                    )
+                    print(f"[{format_ts(time_offset)}] (silence, rms={rms:.4f})")
                     time_offset += chunk_seconds
                     sys.stdout.flush()
                     continue
@@ -174,6 +244,8 @@ def main():
     ap.add_argument("--no-vad", action="store_true")
     ap.add_argument("--cpu-threads", type=int, default=4)
     ap.add_argument("--chunk-seconds", type=float, default=5.0)
+    ap.add_argument("--adaptive-vad", action="store_true", default=True, help="Enable adaptive VAD boundary segmentation (default: True)")
+    ap.add_argument("--no-adaptive-vad", action="store_false", dest="adaptive_vad", help="Disable adaptive VAD")
     args = ap.parse_args()
 
     language = normalize_language(args.language)
@@ -183,13 +255,27 @@ def main():
     vad_filter = not args.no_vad
 
     try:
-        stream_from_stdin(model, language, args.beam_size, vad_filter, args.chunk_seconds)
+        stream_from_stdin(
+            model,
+            language,
+            args.beam_size,
+            vad_filter,
+            args.chunk_seconds,
+            adaptive_vad=args.adaptive_vad,
+        )
     except Exception as e:
         if device != "cpu" and is_cuda_runtime_error(e):
             print(f"[WARN] CUDA execution failed ({e}). Falling back to CPU...", file=sys.stderr)
             cpu_compute = "int8"
             model = load_model(args.model, "cpu", cpu_compute, cpu_threads=args.cpu_threads)
-            stream_from_stdin(model, language, args.beam_size, vad_filter, args.chunk_seconds)
+            stream_from_stdin(
+                model,
+                language,
+                args.beam_size,
+                vad_filter,
+                args.chunk_seconds,
+                adaptive_vad=args.adaptive_vad,
+            )
         else:
             print(f"[ERROR] {e}", file=sys.stderr)
             sys.exit(1)

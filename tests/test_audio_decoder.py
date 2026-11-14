@@ -2,8 +2,14 @@
 
 import io
 import os
+import sys
 import unittest
 import wave
+from pathlib import Path
+
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
 
 from server.audio_decoder import (
     decode_audio_to_pcm16,
@@ -50,8 +56,13 @@ class TestAudioDecoder(unittest.TestCase):
         self.assertEqual(decoded, raw_pcm)
 
     def test_decode_ogg_opus_file(self):
-        sample_ogg = "/botworkspace/speech_experimental/phone_ipcam_audio/audio_001.ogg"
-        if not os.path.exists(sample_ogg):
+        sample_candidates = [
+            _PKG_ROOT / "audio_001.ogg",
+            _PKG_ROOT / "phone_ipcam_audio" / "audio_001.ogg",
+            Path("/botworkspace/speech_experimental/phone_ipcam_audio/audio_001.ogg"),
+        ]
+        sample_ogg = next((str(p) for p in sample_candidates if p.exists()), None)
+        if not sample_ogg or not os.path.exists(sample_ogg):
             self.skipTest("Sample Ogg file not found")
 
         with open(sample_ogg, "rb") as f:

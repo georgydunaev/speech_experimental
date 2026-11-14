@@ -1,6 +1,6 @@
 """
 Transcription service engine wrapping faster-whisper with hardware auto-detection,
-CUDA-to-CPU failover, and thread safety.
+CUDA-to-CPU failover, adaptive VAD silence filtering, and thread safety.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .transcript_logger import TranscriptLogger, format_ts
-from .vad import SpeechChunk, SpeechSegmenter
+from .vad import EnergyVAD, SpeechChunk, SpeechSegmenter
 
 
 def write_wav(path: str, audio_f32: np.ndarray, samplerate: int = 16000):
@@ -73,7 +73,7 @@ def is_cuda_runtime_error(err: Exception) -> bool:
 
 class Transcriber:
     """
-    Robust faster-whisper wrapper with VAD and structured transcript logging.
+    Robust faster-whisper wrapper with integrated adaptive VAD and structured transcript logging.
     """
 
     def __init__(
@@ -85,12 +85,18 @@ class Transcriber:
         beam_size: int = 5,
         cpu_threads: int = 4,
         logger: Optional[TranscriptLogger] = None,
+        vad_filter: bool = True,
+        min_energy_threshold: float = 0.005,
     ):
         self.model_name = model_name
         self.language = language if language and language.lower() not in {"auto", "none"} else None
         self.beam_size = beam_size
         self.cpu_threads = cpu_threads
         self.logger = logger
+        self.vad_filter = vad_filter
+
+        self.vad = EnergyVAD(sample_rate=16000, min_energy_threshold=min_energy_threshold) if vad_filter else None
+        self.segmenter = SpeechSegmenter(sample_rate=16000, min_energy_threshold=min_energy_threshold) if vad_filter else None
 
         self.device, self.compute_type = detect_device(device, compute_type)
         self.lock = threading.Lock()
@@ -114,7 +120,7 @@ class Transcriber:
 
     def _execute_inference(self, audio_path: str) -> Tuple[List[Any], Any]:
         try:
-            return list(self.model.transcribe(audio_path, language=self.language, beam_size=self.beam_size, vad_filter=True))
+            return list(self.model.transcribe(audio_path, language=self.language, beam_size=self.beam_size, vad_filter=self.vad_filter))
         except Exception as e:
             if self.device != "cpu" and is_cuda_runtime_error(e):
                 print(f"[WARN] CUDA runtime error encountered: {e}. Switching to CPU int8...", file=sys.stderr)
@@ -127,7 +133,7 @@ class Transcriber:
                     compute_type="int8",
                     cpu_threads=self.cpu_threads,
                 )
-                return list(self.model.transcribe(audio_path, language=self.language, beam_size=self.beam_size, vad_filter=True))
+                return list(self.model.transcribe(audio_path, language=self.language, beam_size=self.beam_size, vad_filter=self.vad_filter))
             raise
 
     def transcribe_chunk(
@@ -137,12 +143,22 @@ class Transcriber:
     ) -> List[Dict[str, Any]]:
         """
         Transcribe a single speech chunk and log results.
+        Inhibits Whisper inference on silence or ambient noise chunks to prevent hallucinations.
         """
-        if self.model is None:
-            self.load()
-
         if chunk.audio_data.size == 0:
             return []
+
+        # Integrated silence accumulation filter
+        if self.vad is not None:
+            chunk_energy = float(np.sqrt(np.mean(np.square(chunk.audio_data))))
+            dynamic_thresh = max(self.vad.min_energy_threshold, self.vad.noise_floor * self.vad.snr_multiplier)
+            if chunk_energy < dynamic_thresh:
+                # Update adaptive noise floor on silence chunk
+                self.vad.noise_floor = (1.0 - self.vad.noise_floor_alpha) * self.vad.noise_floor + self.vad.noise_floor_alpha * chunk_energy
+                return []
+
+        if self.model is None:
+            self.load()
 
         tmp_dir = os.environ.get("TMPDIR") or None
         results = []
@@ -163,6 +179,7 @@ class Transcriber:
 
                 abs_start = chunk.start_sec + (seg.start or 0.0)
                 abs_end = chunk.start_sec + (seg.end or chunk.duration_sec)
+                avg_logprob = getattr(seg, "avg_logprob", None)
 
                 rec = {
                     "text": text,
@@ -171,6 +188,7 @@ class Transcriber:
                     "duration_sec": abs_end - abs_start,
                     "language": detected_lang,
                     "language_prob": detected_prob,
+                    "avg_logprob": avg_logprob,
                     "client_id": client_id or "default",
                 }
                 results.append(rec)
@@ -182,7 +200,40 @@ class Transcriber:
                         end_sec=abs_end,
                         language=detected_lang,
                         language_prob=detected_prob,
+                        avg_logprob=avg_logprob,
                         client_id=client_id,
                     )
 
         return results
+
+    def transcribe_audio_stream(
+        self,
+        audio_f32: np.ndarray,
+        client_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Feed continuous float32 audio through the adaptive VAD speech segmenter and transcribe.
+        """
+        if self.segmenter is None:
+            chunk = SpeechChunk(audio_f32, 0.0, float(len(audio_f32) / 16000.0), is_final=True)
+            return self.transcribe_chunk(chunk, client_id=client_id)
+
+        speech_chunks = self.segmenter.feed_float32(audio_f32)
+        results = []
+        for sc in speech_chunks:
+            results.extend(self.transcribe_chunk(sc, client_id=client_id))
+        return results
+
+    def transcribe_pcm16_bytes(
+        self,
+        pcm_bytes: bytes,
+        client_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Feed raw PCM s16le bytes through the adaptive VAD speech segmenter and transcribe.
+        """
+        if not pcm_bytes:
+            return []
+        pcm16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+        f32 = pcm16.astype(np.float32) / 32768.0
+        return self.transcribe_audio_stream(f32, client_id=client_id)

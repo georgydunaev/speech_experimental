@@ -2,10 +2,16 @@
 
 import io
 import os
+import sys
 import tempfile
 import time
 import unittest
 import wave
+from pathlib import Path
+
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
 
 from server.audio_server import ClientSession
 from server.jitter_buffer import AudioJitterBuffer
@@ -128,8 +134,13 @@ class TestReconnectAndOfflineQueue(unittest.TestCase):
         self.session.ingest_chunk(seq_id=1, audio_bytes=wav_chunk, format_hint="wav")
 
         # 3. Ingest Ogg/Opus if sample file exists
-        sample_ogg = "/botworkspace/speech_experimental/phone_ipcam_audio/audio_001.ogg"
-        if os.path.exists(sample_ogg):
+        sample_candidates = [
+            _PKG_ROOT / "audio_001.ogg",
+            _PKG_ROOT / "phone_ipcam_audio" / "audio_001.ogg",
+            Path("/botworkspace/speech_experimental/phone_ipcam_audio/audio_001.ogg"),
+        ]
+        sample_ogg = next((str(p) for p in sample_candidates if p.exists()), None)
+        if sample_ogg and os.path.exists(sample_ogg):
             with open(sample_ogg, "rb") as f:
                 ogg_bytes = f.read()
             self.session.ingest_chunk(seq_id=2, audio_bytes=ogg_bytes, format_hint="ogg")

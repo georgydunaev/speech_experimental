@@ -1,7 +1,14 @@
 """Unit tests for Voice Activity Detection and Speech Segmentation."""
 
+import sys
 import unittest
+from pathlib import Path
+
 import numpy as np
+
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
 
 from server.vad import EnergyVAD, SpeechSegmenter, SpeechChunk
 
