@@ -6,6 +6,12 @@ from .transcript_logger import TranscriptLogger
 from .transcriber import Transcriber
 from .vad import EnergyVAD, SpeechChunk, SpeechSegmenter
 
+try:
+    from .audio_server import ClientSession, SpeechServer
+except ImportError:  # pragma: no cover
+    ClientSession = None  # type: ignore
+    SpeechServer = None  # type: ignore
+
 __all__ = [
     "EnergyVAD",
     "SpeechChunk",
@@ -15,4 +21,6 @@ __all__ = [
     "Transcriber",
     "decode_audio_to_pcm16",
     "detect_audio_format",
+    "ClientSession",
+    "SpeechServer",
 ]

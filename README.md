@@ -1,93 +1,47 @@
-# Local On-the-fly Speech Recognition for GTX 1660 Ti Mobile
+# Resilient Local and Mobile Streaming Speech Recognition (`speech_experimental`)
 
-This directory contains a practical setup for **local, on-the-fly (low-latency) speech recognition** suitable for an NVIDIA **GeForce GTX 1660 Ti Mobile (6 GB VRAM, Turing, CUDA Compute 7.5)**.
+This repository contains the modular streaming speech recognition server, adaptive Voice Activity Detection (VAD) pipeline, browser/Android mobile audio transmitters, and automated verification suite built around `faster-whisper` (CTranslate2 backend for OpenAI Whisper).
 
-## GPU fit (GTX 1660 Ti Mobile)
+For a full architectural breakdown, see [PROJECT_OVERVIEW.md](file:///botworkspace/speech_experimental/PROJECT_OVERVIEW.md).
+
+## Hardware Target (GTX 1660 Ti Mobile)
 
 | Property | Value | Notes |
 |---|---|---|
-| VRAM | 6 GB | Enough for Whisper `tiny/base/small` comfortably; `medium` possible with quantization |
-| CUDA Compute Capability | 7.5 | Supports FP16 acceleration |
-| Typical use | Laptop/mobile GPU | Favor efficient runtimes and quantized models for real-time speed |
+| VRAM | 6 GB | Fits Whisper `tiny`, `base`, `small` comfortably; `medium` with `int8_float16` |
+| CUDA Compute Capability | 7.5 | Supports FP16 and INT8 acceleration |
+| CPU Fallback | Automatic | Falls back to `device="cpu"`, `compute_type="int8"` when CUDA is absent |
 
-## Recommended model/runtime: `faster-whisper`
+## Key Components
 
-**Recommendation:** [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 backend for OpenAI Whisper).
+- **Server Package (`server/`)**:
+  - [vad.py](file:///botworkspace/speech_experimental/server/vad.py): `EnergyVAD` and `SpeechSegmenter` for adaptive silence filtering and pre-roll speech segmentation.
+  - [jitter_buffer.py](file:///botworkspace/speech_experimental/server/jitter_buffer.py): `AudioJitterBuffer` for packet sequence ordering, deduplication, and reconnect continuity.
+  - [audio_decoder.py](file:///botworkspace/speech_experimental/server/audio_decoder.py): In-memory decoding of WAV, Ogg/Opus, WebM/Opus, and raw 16 kHz mono PCM.
+  - [transcript_logger.py](file:///botworkspace/speech_experimental/server/transcript_logger.py): `TranscriptLogger` writing rotating `.jsonl` and `.md` transcripts.
+  - [audio_server.py](file:///botworkspace/speech_experimental/server/audio_server.py): `SpeechServer` and `ClientSession` supporting HTTP POST, WebSocket, raw TCP, and Unix domain socket streaming.
+- **CLI Entrypoints**:
+  - [realtime_transcribe.py](file:///botworkspace/speech_experimental/realtime_transcribe.py): File, microphone, and stdin streaming transcription with VAD and structured logging.
+  - [stream_transcriber.py](file:///botworkspace/speech_experimental/stream_transcriber.py): Continuous raw PCM stdin transcriber.
+- **Mobile Clients**:
+  - [web_client/](file:///botworkspace/speech_experimental/web_client/index.html): Progressive web recorder with Wake Lock API and IndexedDB offline buffering.
+  - [android_recorder/](file:///botworkspace/speech_experimental/android_recorder/README.md): Kotlin Android foreground service (`AudioStreamService.kt`) with MIUI battery-saver mitigation.
+- **Test Suite (`tests/`)**:
+  - Run `python3 -m unittest discover -s tests -p "test_*.py"` to verify VAD, jitter buffering, audio decoding, transcript rotation, and server protocol handling.
 
-Why this is a good fit for on-the-fly use on GTX 1660 Ti Mobile:
-- **Fast inference**: CTranslate2 is significantly faster and lighter than vanilla PyTorch Whisper.
-- **Low VRAM**: Quantized compute types (`int8_float16`, `int8`) let `small`/`medium` models fit in 6 GB.
-- **Good accuracy/speed tradeoff**: Whisper models are strong multilingual ASR models.
-- **Simple deployment**: Python package + model auto-download; no large framework stack required.
-- **Streaming-friendly**: Supports VAD-filtered chunking for near-real-time transcription of microphone or audio streams/files.
-
-### Suggested model choices (6 GB GPU)
-
-| Model | VRAM (approx, GPU) | Relative speed | Accuracy | Best for |
-|---|---:|---:|---:|---|
-| `tiny` / `tiny.en` | ~1 GB | Fastest | Basic | Very low latency, quick tests |
-| `base` / `base.en` | ~1 GB | Very fast | Good | Fast on-the-fly transcription |
-| `small` / `small.en` | ~2 GB | Fast | Better | **Recommended default for this GPU** |
-| `medium` / `medium.en` | ~3-5 GB (with `int8_float16`) | Moderate | High | Higher accuracy if latency budget allows |
-| `distil-large-v3` (English-focused distilled) | ~2-3 GB | Fast for size | High (EN) | Fast high-quality English transcription |
-
-> For strictly English use, `.en` / distilled English models are usually faster and/or more accurate.
-
-### Suggested runtime settings for GTX 1660 Ti Mobile
-
-- `device="cuda"`, `compute_type="int8_float16"` (good speed/VRAM balance on Turing), or `float16` if preferred.
-- Fallback: `device="cpu"`, `compute_type="int8"` when CUDA is unavailable in the container.
-- Enable `vad_filter=True` to skip silence and improve responsiveness.
-- For on-the-fly behavior, transcribe short chunks (e.g. 2-5 seconds) from microphone or an audio stream.
-
-## Alternatives considered
-
-| Option | Pros | Cons / Why not primary |
-|---|---|---|
-| **whisper.cpp** (`ggml`, CUDA/cuBLAS build) | Very lightweight, great C++ deployment, low overhead | Requires building from source for CUDA; more setup work in-container |
-| **Vosk** | True streaming API, small CPU footprint, easy real-time mic use | Generally lower accuracy than Whisper on diverse audio/languages |
-| **OpenAI Whisper (PyTorch)** | Reference implementation | Heavier, slower, higher VRAM/use than faster-whisper |
-| **NVIDIA NeMo / Parakeet / Canary** | Strong models, enterprise features | Heavier dependencies; more complex setup; can be overkill for quick try-out |
-| **WhisperLive / whisper_streaming** | Purpose-built streaming stacks | Extra moving parts; this setup provides a simple local chunked on-the-fly demo first |
-
-## What this setup provides
-
-- `install.sh` — container-friendly installation script (creates a Python venv, installs system deps like `ffmpeg`, installs `faster-whisper` and mic/audio deps).
-- `realtime_transcribe.py` — demo script for:
-  - **Microphone (on-the-fly chunked)** transcription (requires host audio device passthrough into container)
-  - **File / stream-like chunked** transcription (works without microphone; useful to validate setup)
-  - Automatic CUDA/CPU device selection
-- `requirements.txt` — Python dependencies.
-
-## Quick start
+## Quick Start
 
 ```bash
-cd /botworkspace/speech
+cd /botworkspace/speech_experimental
 bash ./install.sh
-
-# Activate environment
 source .venv/bin/activate
 
-# 1) Transcribe an audio file in on-the-fly-style chunks
-python realtime_transcribe.py --file path/to/audio.wav --model small --compute-type int8_float16
+# 1. Run unit tests
+python3 -m unittest discover -s tests -p "test_*.py"
 
-# 2) List audio input devices (if mic is passed through)
-python realtime_transcribe.py --list-devices
+# 2. Start multi-protocol streaming ASR server
+python3 -m server.audio_server --host 0.0.0.0 --port 8080 --tcp-port 8082 --model small
 
-# 3) Live microphone transcription (if audio device available)
-python realtime_transcribe.py --mic --model small --chunk-seconds 4
+# 3. Transcribe an audio file with VAD and structured logging
+python3 realtime_transcribe.py --file audio_001.ogg --model small --log-dir logs
 ```
-
-## Container notes
-
-- **GPU access:** The container must be run with NVIDIA GPU passthrough (e.g. `--gpus all` / nvidia-container-toolkit) and matching CUDA userspace libraries for `device=cuda` to work. The script auto-falls back to CPU if CUDA is unavailable.
-- **Microphone access:** Live mic mode requires audio devices passed into the container (e.g. `/dev/snd` and ALSA/Pulse config). If unavailable, use `--file` mode to verify transcription.
-- **Models cache:** Downloaded Whisper models are cached under `~/.cache/huggingface/` (or set `HF_HOME`).
-- **ffmpeg:** Installed by `install.sh` for broad audio format support.
-
-## References
-
-- faster-whisper: https://github.com/SYSTRAN/faster-whisper
-- CTranslate2: https://github.com/OpenNMT/CTranslate2
-- OpenAI Whisper model family: https://github.com/openai/whisper
-- Silero VAD (commonly used with streaming Whisper): https://github.com/snakers4/silero-vad
