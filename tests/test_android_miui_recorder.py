@@ -98,6 +98,17 @@ class TestAndroidMiuiRecorder(unittest.TestCase):
         self.assertIn("AutoStartManagementActivity", res.stdout)
         self.assertIn("HiddenAppsConfigActivity", res.stdout)
 
+    def test_web_client_css_class_scope_isolation(self):
+        auditor = "/botworkspace/tools/css_class_scope_auditor.py"
+        res = subprocess.run(
+            ["python3", auditor, "--strict", REPO_ROOT],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(res.returncode, 0, f"CSS scoping violations found:\n{res.stdout}\n{res.stderr}")
+        self.assertIn("found 0 violation(s)", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
