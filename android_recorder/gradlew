@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Gradle Wrapper script for Speech Foreground Recorder (Xiaomi Redmi Note 8 / MIUI)
+set -euo pipefail
+
+APP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRAPPER_JAR="${APP_HOME}/gradle/wrapper/gradle-wrapper.jar"
+
+if command -v gradle >/dev/null 2>&1; then
+  exec gradle -p "${APP_HOME}" "$@"
+elif [ -f "${WRAPPER_JAR}" ]; then
+  JAVA_BIN="${JAVA_HOME:+${JAVA_HOME}/bin/}java"
+  exec "${JAVA_BIN:-java}" -Xmx64m -Xms64m -jar "${WRAPPER_JAR}" "$@"
+else
+  echo "[ERROR] Neither system 'gradle' nor '${WRAPPER_JAR}' is installed." >&2
+  echo "Install Gradle or Android Studio on the host machine and re-run:" >&2
+  echo "  bash ${APP_HOME}/build_and_provision_miui.sh" >&2
+  exit 1
+fi
