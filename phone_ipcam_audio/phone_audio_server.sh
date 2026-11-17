@@ -406,14 +406,15 @@ def normalize_language(lang: Optional[str]) -> Optional[str]:
     if lang is None:
         return None
     l = str(lang).strip()
-    if not l or l.lower() in {"auto", "none", "null"}:
+    if not l or l.lower() in {"auto", "none", "null", "c", "posix"}:
         return None
-    for sep in (":", ",", "_", "-"):
+    for sep in (":", ",", ";", ".", "_", "-"):
         if sep in l:
             l = l.split(sep, 1)[0]
-            break
     l = l.strip().lower()
-    return l or None
+    if not l or l in {"auto", "none", "null", "c", "posix"}:
+        return None
+    return l
 
 
 def cuda_runtime_available() -> bool:
@@ -603,7 +604,7 @@ def ffmpeg_decode_to_pcm(byte_iter):
                     try:
                         proc.stdin.write(chunk)
                         proc.stdin.flush()
-                    except BrokenPipeError:
+                    except (BrokenPipeError, ValueError, OSError):
                         break
         finally:
             with contextlib.suppress(Exception):

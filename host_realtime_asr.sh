@@ -318,15 +318,16 @@ def normalize_language(lang: Optional[str]) -> Optional[str]:
     if lang is None:
         return None
     l = str(lang).strip()
-    if not l or l.lower() in {"auto", "none", "null"}:
+    if not l or l.lower() in {"auto", "none", "null", "c", "posix"}:
         return None
-    # Normalize locale-like values (e.g. en_US, en_US:en, en-US) to Whisper language codes.
-    for sep in (":", ",", "_", "-"):
+    # Normalize locale-like values (e.g. en_US, en_US:en, en_US.UTF-8, en-US) to Whisper language codes.
+    for sep in (":", ",", ";", ".", "_", "-"):
         if sep in l:
             l = l.split(sep, 1)[0]
-            break
     l = l.strip().lower()
-    return l or None
+    if not l or l in {"auto", "none", "null", "c", "posix"}:
+        return None
+    return l
 
 
 def detect_device(requested: str, requested_compute: Optional[str]):

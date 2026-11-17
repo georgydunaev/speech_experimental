@@ -27,14 +27,15 @@ def normalize_language(lang: Optional[str]) -> Optional[str]:
     if lang is None:
         return None
     cleaned = str(lang).strip()
-    if not cleaned or cleaned.lower() in {"auto", "none", "null"}:
+    if not cleaned or cleaned.lower() in {"auto", "none", "null", "c", "posix"}:
         return None
-    for sep in (":", ",", "_", "-"):
+    for sep in (":", ",", ";", ".", "_", "-"):
         if sep in cleaned:
             cleaned = cleaned.split(sep, 1)[0]
-            break
     cleaned = cleaned.strip().lower()
-    return cleaned or None
+    if not cleaned or cleaned in {"auto", "none", "null", "c", "posix"}:
+        return None
+    return cleaned
 
 
 def detect_device(requested: str, requested_compute: Optional[str]):
