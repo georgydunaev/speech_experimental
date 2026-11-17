@@ -24,6 +24,7 @@ mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$PIP_CACHE_DIR" 
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL="${MODEL:-small}"
+DEVICE_ENV_SET="${DEVICE:+1}"
 DEVICE="${DEVICE:-auto}"
 COMPUTE_TYPE="${COMPUTE_TYPE:-}"
 CHUNK_SECONDS="${CHUNK_SECONDS:-4}"
@@ -31,6 +32,9 @@ LANGUAGE="${LANGUAGE:-}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 BEAM_SIZE="${BEAM_SIZE:-5}"
+
+CPU_LABEL="AMD® Ryzen 7 4800h with radeon graphics × 16"
+GPU_LABEL="NVIDIA Corporation TU116M [GeForce GTX 1660 Ti Mobile]"
 
 log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf '\n[WARN] %s\n' "$*" >&2; }
@@ -135,10 +139,81 @@ PY
   fi
 }
 
+# --- Helpers for LAN IP detection & local CUDA runtime libraries ---
+detect_lan_ips() {
+  local ips=() ip
+  if have ip; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
+    [ -n "$ip" ] && ips+=("$ip")
+    while IFS= read -r ip; do
+      [ -n "$ip" ] && ips+=("$ip")
+    done < <(ip -o -4 addr show up scope global 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr)/ {split($4,a,"/"); print a[1]}' || true)
+  fi
+  if [ "${#ips[@]}" -eq 0 ] && have hostname; then
+    for ip in $(hostname -I 2>/dev/null || true); do
+      case "$ip" in 127.*|*:*|"") ;; *) ips+=("$ip") ;; esac
+    done
+  fi
+  if [ "${#ips[@]}" -gt 0 ]; then
+    printf "%s\n" "${ips[@]}" | awk '!seen[$0]++ && NF'
+  fi
+}
+
+ensure_local_cuda_libs() {
+  local ws_root
+  ws_root="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || true)"
+  local candidate_dirs=()
+  local d
+  for d in \
+    "$LOCAL_HOME/cuda_lib" \
+    "$VENV_DIR"/lib/python*/site-packages/nvidia/cublas/lib \
+    "$VENV_DIR"/lib/python*/site-packages/nvidia/cudnn/lib \
+    "$VENV_DIR"/lib/python*/site-packages/nvidia/cuda_runtime/lib \
+    "$ws_root/installed/lib/ollama/cuda_v12" \
+    "$ws_root"/kobold/images/.venv_diffusion/lib/python*/site-packages/nvidia/cublas/lib \
+    /usr/local/cuda/lib64 \
+    /usr/lib/x86_64-linux-gnu; do
+    if [ -d "$d" ]; then
+      candidate_dirs+=("$d")
+    fi
+  done
+
+  local has_cublas=0
+  for d in "${candidate_dirs[@]}"; do
+    if [ -f "$d/libcublas.so.12" ] || [ -f "$d/libcublas.so.11" ] || [ -f "$d/libcublas.so" ]; then
+      has_cublas=1
+      break
+    fi
+  done
+
+  if [ "$has_cublas" -eq 0 ] && { [ "$DEVICE" = "cuda" ] || [ "$DEVICE" = "auto" ]; }; then
+    log "Installing local CUDA 12 cublas runtime into $VENV_DIR (nvidia-cublas-cu12)..."
+    if python -m pip install --no-user "nvidia-cublas-cu12" >/dev/null 2>&1; then
+      for d in "$VENV_DIR"/lib/python*/site-packages/nvidia/cublas/lib; do
+        [ -d "$d" ] && candidate_dirs=("$d" "${candidate_dirs[@]}")
+      done
+    fi
+  fi
+
+  local prepend_ld=""
+  for d in "${candidate_dirs[@]}"; do
+    case ":${prepend_ld}:${LD_LIBRARY_PATH:-}:" in
+      *":$d:"*) ;;
+      *) prepend_ld="${prepend_ld:+$prepend_ld:}$d" ;;
+    esac
+  done
+  if [ -n "$prepend_ld" ]; then
+    export LD_LIBRARY_PATH="${prepend_ld}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
 # --- Args ---
 RUNTIME_ARGS=()
 SHOW_HELP=0
 USE_HTTPS=0
+DEVICE_SET="${DEVICE_ENV_SET:-0}"
+PROTOCOL_SET=0
+NO_INTERACTIVE=0
 SSL_CERT=""
 SSL_KEY=""
 while [ $# -gt 0 ]; do
@@ -149,8 +224,10 @@ while [ $# -gt 0 ]; do
     --port=*) PORT="${1#*=}"; shift ;;
     --model) MODEL="${2:-$MODEL}"; shift 2 ;;
     --model=*) MODEL="${1#*=}"; shift ;;
-    --device) DEVICE="${2:-$DEVICE}"; shift 2 ;;
-    --device=*) DEVICE="${1#*=}"; shift ;;
+    --device) DEVICE="${2:-$DEVICE}"; DEVICE_SET=1; shift 2 ;;
+    --device=*) DEVICE="${1#*=}"; DEVICE_SET=1; shift ;;
+    --cpu) DEVICE="cpu"; DEVICE_SET=1; shift ;;
+    --gpu|--cuda) DEVICE="cuda"; DEVICE_SET=1; shift ;;
     --compute-type) COMPUTE_TYPE="${2:-$COMPUTE_TYPE}"; shift 2 ;;
     --compute-type=*) COMPUTE_TYPE="${1#*=}"; shift ;;
     --language) LANGUAGE="${2:-$LANGUAGE}"; shift 2 ;;
@@ -159,44 +236,122 @@ while [ $# -gt 0 ]; do
     --chunk-seconds=*) CHUNK_SECONDS="${1#*=}"; shift ;;
     --beam-size) BEAM_SIZE="${2:-$BEAM_SIZE}"; shift 2 ;;
     --beam-size=*) BEAM_SIZE="${1#*=}"; shift ;;
-    --https) USE_HTTPS=1; shift ;;
-    --cert) SSL_CERT="${2:-}"; shift 2 ;;
-    --cert=*) SSL_CERT="${1#*=}"; shift ;;
-    --key) SSL_KEY="${2:-}"; shift 2 ;;
-    --key=*) SSL_KEY="${1#*=}"; shift ;;
+    --https) USE_HTTPS=1; PROTOCOL_SET=1; shift ;;
+    --http) USE_HTTPS=0; PROTOCOL_SET=1; shift ;;
+    --no-interactive) NO_INTERACTIVE=1; shift ;;
+    --cert) SSL_CERT="${2:-}"; PROTOCOL_SET=1; shift 2 ;;
+    --cert=*) SSL_CERT="${1#*=}"; PROTOCOL_SET=1; shift ;;
+    --key) SSL_KEY="${2:-}"; PROTOCOL_SET=1; shift 2 ;;
+    --key=*) SSL_KEY="${1#*=}"; PROTOCOL_SET=1; shift ;;
     --help|-h) SHOW_HELP=1; shift ;;
     *) RUNTIME_ARGS+=("$1"); shift ;;
   esac
 done
+
+case "${DEVICE,,}" in
+  gpu|cuda) DEVICE="cuda" ;;
+  cpu) DEVICE="cpu" ;;
+  auto|"") DEVICE="auto" ;;
+esac
 
 if [ "$SHOW_HELP" -eq 1 ]; then
   cat <<EOF
 Usage: $0 [options]
   --host HOST             Bind address (default: 0.0.0.0)
   --port PORT             HTTP/WebSocket port (default: 8080)
+  --http                  Serve over plain HTTP/WS (skips protocol prompt)
   --https                 Serve over HTTPS/WSS with a local self-signed cert (recommended for phone mic over LAN)
   --cert FILE             TLS certificate file (use with --key; implies HTTPS)
   --key FILE              TLS private key file (use with --cert; implies HTTPS)
   --model NAME            faster-whisper model (default: small)
-  --device auto|cuda|cpu  Inference device (default: auto)
+  --device auto|cuda|gpu|cpu  Inference device (default: interactive prompt or auto)
+  --cpu                   Shortcut for --device cpu (${CPU_LABEL})
+  --gpu                   Shortcut for --device cuda (${GPU_LABEL})
   --compute-type TYPE     e.g. int8_float16, int8, float16
   --language CODE         Force language, e.g. en (default: auto)
   --chunk-seconds N       Transcription chunk size seconds (default: 4)
   --beam-size N           Beam size (default: 5)
+  --no-interactive        Do not prompt interactively for CPU/GPU or http/https on startup
 
-Open http(s)://<LAPTOP_LAN_IP>:PORT on your phone, allow mic, and start streaming.
+Open http(s)://<SERVER_LAN_IP>:PORT on your phone, allow mic, and start streaming.
 Note: many mobile browsers require HTTPS for microphone access on non-localhost origins.
 EOF
   exit 0
 fi
 
+# Interactive startup prompts for CPU vs GPU and http vs https when running in a terminal
+if [ "$NO_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
+  if [ "$DEVICE_SET" -eq 0 ]; then
+    echo ""
+    echo "============================================================"
+    echo "Select inference processor (CPU or GPU):"
+    echo "  1) CPU : ${CPU_LABEL}"
+    echo "  2) GPU : ${GPU_LABEL}"
+    echo "============================================================"
+    while true; do
+      read -r -p "Choose processor [1/cpu or 2/gpu] (default: 2 - GPU): " _dev_choice </dev/tty || _dev_choice=""
+      case "${_dev_choice,,}" in
+        1|cpu)
+          DEVICE="cpu"
+          log "Selected CPU: ${CPU_LABEL}"
+          break
+          ;;
+        2|gpu|cuda|"")
+          DEVICE="cuda"
+          log "Selected GPU: ${GPU_LABEL}"
+          break
+          ;;
+        auto)
+          DEVICE="auto"
+          log "Selected device: auto"
+          break
+          ;;
+        *)
+          echo "Please enter 1 (cpu) or 2 (gpu)."
+          ;;
+      esac
+    done
+  fi
+
+  if [ "$PROTOCOL_SET" -eq 0 ]; then
+    echo ""
+    echo "============================================================"
+    echo "Select connection protocol (http or https):"
+    echo "  1) http  : Plain HTTP/WS"
+    echo "  2) https : HTTPS/WSS (local self-signed TLS cert; recommended for phone mic over LAN)"
+    echo "============================================================"
+    while true; do
+      read -r -p "Choose protocol [1/http or 2/https] (default: 1 - http): " _proto_choice </dev/tty || _proto_choice=""
+      case "${_proto_choice,,}" in
+        1|http|"")
+          USE_HTTPS=0
+          log "Selected protocol: http"
+          break
+          ;;
+        2|https)
+          USE_HTTPS=1
+          log "Selected protocol: https"
+          break
+          ;;
+        *)
+          echo "Please enter 1 (http) or 2 (https)."
+          ;;
+      esac
+    done
+  fi
+fi
+
 ensure_venv
+ensure_local_cuda_libs
 ensure_local_ffmpeg
 
 if ! have ffmpeg; then
   echo "ERROR: ffmpeg is required for decoding browser audio and was not found/downloaded locally." >&2
   exit 1
 fi
+
+mapfile -t DETECTED_LAN_IPS < <(detect_lan_ips)
+PRIMARY_LAN_IP="${DETECTED_LAN_IPS[0]:-127.0.0.1}"
 
 # HTTPS/WSS support (many mobile browsers require secure context for microphone on LAN URLs)
 if [ -n "$SSL_CERT" ] || [ -n "$SSL_KEY" ] || [ "$USE_HTTPS" -eq 1 ]; then
@@ -210,16 +365,20 @@ if [ -n "$SSL_CERT" ] || [ -n "$SSL_KEY" ] || [ "$USE_HTTPS" -eq 1 ]; then
     SSL_CERT="$CERT_DIR/selfsigned.crt"
     SSL_KEY="$CERT_DIR/selfsigned.key"
     mkdir -p "$CERT_DIR"
+    SAN_LIST="DNS:localhost,IP:127.0.0.1"
+    for _ip in "${DETECTED_LAN_IPS[@]}"; do
+      SAN_LIST="${SAN_LIST},IP:${_ip}"
+    done
     if [ ! -f "$SSL_CERT" ] || [ ! -f "$SSL_KEY" ]; then
       if have openssl; then
-        log "Generating local self-signed TLS certificate in $CERT_DIR (no system changes)..."
+        log "Generating local self-signed TLS certificate in $CERT_DIR (SAN: $SAN_LIST)..."
         openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
           -keyout "$SSL_KEY" -out "$SSL_CERT" \
-          -subj "/CN=phone-audio-local" \
-          -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || \
+          -subj "/CN=${PRIMARY_LAN_IP}" \
+          -addext "subjectAltName=${SAN_LIST}" >/dev/null 2>&1 || \
         openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
           -keyout "$SSL_KEY" -out "$SSL_CERT" \
-          -subj "/CN=phone-audio-local" >/dev/null 2>&1
+          -subj "/CN=${PRIMARY_LAN_IP}" >/dev/null 2>&1
       else
         echo "ERROR: --https requested but 'openssl' not found to generate a local certificate." >&2
         echo "       Provide --cert/--key, or install openssl on host, or use browser insecure-origin workaround." >&2
@@ -237,10 +396,37 @@ EXTRA_PY=()
 [ "$USE_HTTPS" -eq 1 ] && EXTRA_PY+=(--ssl-cert "$SSL_CERT" --ssl-key "$SSL_KEY")
 
 SCHEME="http"
-[ "$USE_HTTPS" -eq 1 ] && SCHEME="https"
+WS_SCHEME="ws"
+if [ "$USE_HTTPS" -eq 1 ]; then
+  SCHEME="https"
+  WS_SCHEME="wss"
+fi
 
 log "Starting phone audio server (IP Webcam audio-like)"
-log "Open on phone: ${SCHEME}://<LAPTOP_LAN_IP>:${PORT}  (laptop binds ${HOST}:${PORT})"
+echo "============================================================"
+echo "  Server IP   : ${PRIMARY_LAN_IP}"
+echo "  Server Port : ${PORT}"
+echo "  Protocol    : ${SCHEME^^} (${WS_SCHEME}://)"
+if [ "$DEVICE" = "cpu" ]; then
+  echo "  Processor   : CPU (${CPU_LABEL})"
+elif [ "$DEVICE" = "cuda" ]; then
+  echo "  Processor   : GPU (${GPU_LABEL})"
+else
+  echo "  Processor   : auto"
+fi
+echo "  Bind Socket : ${HOST}:${PORT}"
+echo "------------------------------------------------------------"
+echo "  Connect from Phone Browser:"
+if [ "${#DETECTED_LAN_IPS[@]}" -gt 0 ]; then
+  for _ip in "${DETECTED_LAN_IPS[@]}"; do
+    echo "    ${SCHEME}://${_ip}:${PORT}"
+  done
+else
+  echo "    ${SCHEME}://<LAPTOP_LAN_IP>:${PORT}"
+fi
+echo "  Local / Loopback URL:"
+echo "    ${SCHEME}://127.0.0.1:${PORT}"
+echo "============================================================"
 if [ "$USE_HTTPS" -eq 1 ]; then
   log "HTTPS enabled (self-signed). Your phone browser may warn about the certificate; accept/proceed to continue."
 fi
@@ -432,15 +618,50 @@ def cuda_runtime_available() -> bool:
     ]
     for name in candidates:
         try:
-            path = ctypes.util.find_library(name) or name
-            ctypes.CDLL(path)
+            ctypes.CDLL(name)
             return True
+        except Exception:
+            pass
+        try:
+            path = ctypes.util.find_library(name)
+            if path:
+                ctypes.CDLL(path)
+                return True
         except Exception:
             continue
     return False
 
 
+def detect_lan_ips() -> list[str]:
+    import socket
+    ips: list[str] = []
+    with contextlib.suppress(Exception):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("1.1.1.1", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+    with contextlib.suppress(Exception):
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "up", "scope", "global"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                iface = parts[1]
+                if iface.startswith(("lo", "docker", "br-", "veth", "virbr")):
+                    continue
+                addr = parts[3].split("/")[0]
+                if addr and addr not in ips and not addr.startswith("127."):
+                    ips.append(addr)
+    return ips
+
+
 def detect_device(requested: str, requested_compute: Optional[str]):
+    if requested == "gpu":
+        requested = "cuda"
     if requested == "cpu":
         return "cpu", (requested_compute or "int8")
     cuda_count = 0
@@ -808,10 +1029,18 @@ async def main_async(args):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(certfile=args.ssl_cert, keyfile=args.ssl_key)
 
-    print(f"[INFO] Server listening on {scheme}://{host}:{port} (WebSocket {ws_scheme}://.../ws)")
+    lan_ips = detect_lan_ips()
+    primary_ip = lan_ips[0] if lan_ips else (host if host != "0.0.0.0" else "127.0.0.1")
+    print("============================================================")
+    print(f"[INFO] Server listening on {scheme}://{host}:{port}")
+    print(f"[INFO] Server IP : {primary_ip} | Port : {port}")
+    for ip in (lan_ips or [primary_ip]):
+        print(f"[INFO] Phone URL : {scheme}://{ip}:{port}  (WebSocket {ws_scheme}://{ip}:{port}/ws)")
+    print(f"[INFO] Local URL : {scheme}://127.0.0.1:{port}")
+    print("============================================================")
     if ssl_context is not None:
         print("[INFO] HTTPS/WSS enabled. On phone, accept the self-signed certificate warning if prompted.")
-    print("[INFO] On your phone open the URL above, allow microphone, and tap Start streaming. Ctrl+C to stop.")
+    print("[INFO] On your phone open the Phone URL above, allow microphone, and tap Start streaming. Ctrl+C to stop.")
     async with websockets.serve(
         handler,
         host,
@@ -831,7 +1060,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--model", default="small")
-    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    ap.add_argument("--device", choices=["auto", "cuda", "gpu", "cpu"], default="auto")
     ap.add_argument("--compute-type", default=None)
     ap.add_argument("--language", default=None)
     ap.add_argument("--chunk-seconds", type=float, default=4.0)
